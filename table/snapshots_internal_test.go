@@ -152,6 +152,18 @@ func TestMergeSnapshotSummaries(t *testing.T) {
 }
 
 func TestInvalidOperation(t *testing.T) {
-	_, err := updateSnapshotSummaries(Summary{Operation: OpReplace}, nil)
+	_, err := updateSnapshotSummaries(Summary{Operation: Operation("invalid")}, nil)
 	assert.ErrorIs(t, err, iceberg.ErrNotImplemented)
+}
+
+func TestReplaceOperation(t *testing.T) {
+	result, err := updateSnapshotSummaries(Summary{
+		Operation: OpReplace,
+		Properties: iceberg.Properties{
+			"added-data-files":   "1",
+			"deleted-data-files": "2",
+		},
+	}, nil)
+	assert.NoError(t, err)
+	assert.Equal(t, OpReplace, result.Operation)
 }

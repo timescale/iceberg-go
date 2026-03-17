@@ -1595,6 +1595,64 @@ func (t *TableWritingTestSuite) TestReplaceDataFilesNoSnapshot() {
 	t.ErrorContains(err, "cannot replace files in a table without an existing snapshot")
 }
 
+func (t *TableWritingTestSuite) TestRewriteFiles() {
+	ident := table.Identifier{"default", "rewrite_files_v" + strconv.Itoa(t.formatVersion)}
+	tbl := t.createTable(ident, t.formatVersion, *iceberg.UnpartitionedSpec, t.tableSchema)
+
+	files := make([]string, 0, 3)
+	for i := range 3 {
+		filePath := fmt.Sprintf("%s/rewrite_files_v%d/data-%d.parquet", t.location, t.formatVersion, i)
+		t.writeParquet(mustFS(t.T(), tbl).(iceio.WriteFileIO), filePath, t.arrTbl)
+		files = append(files, filePath)
+	}
+
+	tx := tbl.NewTransaction()
+	t.Require().NoError(tx.AddFiles(t.ctx, files, nil, false))
+	tbl, err := tx.Commit(t.ctx)
+	t.Require().NoError(err)
+
+	replacementPath := fmt.Sprintf("%s/rewrite_files_v%d/replacement.parquet", t.location, t.formatVersion)
+	t.writeParquet(mustFS(t.T(), tbl).(iceio.WriteFileIO), replacementPath, t.arrTbl)
+
+	deleteFiles := []iceberg.DataFile{
+		mustDataFile(t.T(), *iceberg.UnpartitionedSpec, files[0], nil, 1, mustFileSize(t.T(), files[0])),
+		mustDataFile(t.T(), *iceberg.UnpartitionedSpec, files[1], nil, 1, mustFileSize(t.T(), files[1])),
+	}
+	addFile := mustDataFile(t.T(), *iceberg.UnpartitionedSpec, replacementPath, nil, 1, mustFileSize(t.T(), replacementPath))
+
+	tx = tbl.NewTransaction()
+	t.Require().NoError(tx.RewriteFiles(t.ctx, deleteFiles, []iceberg.DataFile{addFile}, nil))
+
+	staged, err := tx.StagedTable()
+	t.Require().NoError(err)
+	t.Equal(table.OpReplace, staged.CurrentSnapshot().Summary.Operation)
+	t.Equal("1", staged.CurrentSnapshot().Summary.Properties["added-data-files"])
+	t.Equal("2", staged.CurrentSnapshot().Summary.Properties["deleted-data-files"])
+}
+
+func (t *TableWritingTestSuite) TestRewriteFilesNoSnapshot() {
+	ident := table.Identifier{"default", "rewrite_files_no_snapshot_v" + strconv.Itoa(t.formatVersion)}
+	tbl := t.createTable(ident, t.formatVersion, *iceberg.UnpartitionedSpec, t.tableSchema)
+
+	tx := tbl.NewTransaction()
+	deleteFile := mustDataFile(t.T(), *iceberg.UnpartitionedSpec, "delete.parquet", nil, 1, 1)
+	addFile := mustDataFile(t.T(), *iceberg.UnpartitionedSpec, "add.parquet", nil, 1, 1)
+	err := tx.RewriteFiles(t.ctx, []iceberg.DataFile{deleteFile}, []iceberg.DataFile{addFile}, nil)
+	t.Error(err)
+	t.ErrorContains(err, "cannot rewrite files in a table without an existing snapshot")
+}
+
+func (t *TableWritingTestSuite) TestRewriteFilesNoDeletes() {
+	ident := table.Identifier{"default", "rewrite_files_no_deletes_v" + strconv.Itoa(t.formatVersion)}
+	tbl := t.createTable(ident, t.formatVersion, *iceberg.UnpartitionedSpec, t.tableSchema)
+
+	tx := tbl.NewTransaction()
+	addFile := mustDataFile(t.T(), *iceberg.UnpartitionedSpec, "add.parquet", nil, 1, 1)
+	err := tx.RewriteFiles(t.ctx, nil, []iceberg.DataFile{addFile}, nil)
+	t.Error(err)
+	t.ErrorContains(err, "cannot add files without deleting in a rewrite")
+}
+
 func (t *TableWritingTestSuite) TestExpireSnapshots() {
 	fs := iceio.LocalFS{}
 

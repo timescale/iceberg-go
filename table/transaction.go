@@ -60,6 +60,10 @@ func (s snapshotUpdate) mergeOverwrite(commitUUID *uuid.UUID) *snapshotProducer 
 	return newOverwriteFilesProducer(op, s.txn, s.io, commitUUID, s.snapshotProps)
 }
 
+func (s snapshotUpdate) mergeReplace(commitUUID *uuid.UUID) *snapshotProducer {
+	return newOverwriteFilesProducer(OpReplace, s.txn, s.io, commitUUID, s.snapshotProps)
+}
+
 func (s snapshotUpdate) mergeAppend() *snapshotProducer {
 	return newMergeAppendFilesProducer(OpAppend, s.txn, s.io, nil, s.snapshotProps)
 }
@@ -711,6 +715,100 @@ func (t *Transaction) ReplaceDataFilesWithDataFiles(ctx context.Context, filesTo
 
 	commitUUID := uuid.New()
 	updater := t.updateSnapshot(fs, snapshotProps, OpOverwrite).mergeOverwrite(&commitUUID)
+
+	for _, df := range markedForDeletion {
+		updater.deleteDataFile(df)
+	}
+
+	for _, df := range filesToAdd {
+		updater.appendDataFile(df)
+	}
+
+	updates, reqs, err := updater.commit()
+	if err != nil {
+		return err
+	}
+
+	return t.apply(updates, reqs)
+}
+
+// RewriteFiles atomically replaces data files with new ones containing the
+// same logical data. This is used for compaction operations where the data
+// is reorganized (merged, sorted, re-encoded) but not changed.
+func (t *Transaction) RewriteFiles(ctx context.Context, filesToDelete, filesToAdd []iceberg.DataFile, snapshotProps iceberg.Properties) error {
+	if len(filesToDelete) == 0 && len(filesToAdd) == 0 {
+		return nil
+	}
+
+	if len(filesToDelete) == 0 {
+		return fmt.Errorf("%w: cannot add files without deleting in a rewrite", ErrInvalidOperation)
+	}
+
+	setToAdd, err := t.validateDataFilesToAdd(filesToAdd, "RewriteFiles")
+	if err != nil {
+		return err
+	}
+
+	setToDelete := make(map[string]struct{}, len(filesToDelete))
+	for i, df := range filesToDelete {
+		if df == nil {
+			return fmt.Errorf("nil data file at index %d for RewriteFiles", i)
+		}
+
+		path := df.FilePath()
+		if path == "" {
+			return errors.New("delete data file paths must be non-empty for RewriteFiles")
+		}
+
+		if _, ok := setToDelete[path]; ok {
+			return errors.New("delete data file paths must be unique for RewriteFiles")
+		}
+		setToDelete[path] = struct{}{}
+	}
+
+	s := t.meta.currentSnapshot()
+	if s == nil {
+		return fmt.Errorf("%w: cannot rewrite files in a table without an existing snapshot", ErrInvalidOperation)
+	}
+
+	fs, err := t.tbl.fsF(ctx)
+	if err != nil {
+		return err
+	}
+
+	markedForDeletion := make([]iceberg.DataFile, 0, len(setToDelete))
+	for df, err := range s.dataFiles(fs, nil) {
+		if err != nil {
+			return err
+		}
+
+		if _, ok := setToDelete[df.FilePath()]; ok {
+			markedForDeletion = append(markedForDeletion, df)
+		}
+
+		if _, ok := setToAdd[df.FilePath()]; ok {
+			return fmt.Errorf("cannot add files that are already referenced by table, files: %s", df.FilePath())
+		}
+	}
+
+	if len(markedForDeletion) != len(setToDelete) {
+		return errors.New("cannot delete files that do not belong to the table")
+	}
+
+	if t.meta.NameMapping() == nil {
+		nameMapping := t.meta.CurrentSchema().NameMapping()
+		mappingJson, err := json.Marshal(nameMapping)
+		if err != nil {
+			return err
+		}
+		err = t.SetProperties(iceberg.Properties{DefaultNameMappingKey: string(mappingJson)})
+		if err != nil {
+			return err
+		}
+	}
+
+	commitUUID := uuid.New()
+	updater := t.updateSnapshot(fs, snapshotProps, OpReplace).mergeReplace(&commitUUID)
 
 	for _, df := range markedForDeletion {
 		updater.deleteDataFile(df)

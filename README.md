@@ -147,7 +147,7 @@ the table, the following tracks the current write support:
 |:---------------------|:---------:|
 | Append Stream        |     X     |
 | Append Data Files    |     X     |
-| Rewrite Files        |           |
+| Rewrite Files        |     X     |
 | Rewrite manifests    |           |
 | Overwrite Files      |     X     |
 | Copy-On-Write Delete |     X     |
