@@ -366,6 +366,83 @@ func (s Snapshot) dataFiles(fio iceio.IO, fileFilter set[iceberg.ManifestEntryCo
 	}
 }
 
+// AddedDataFiles returns an iterator over data files that were added by this snapshot.
+// This only includes files with content type Data (not delete files).
+func (s Snapshot) AddedDataFiles(fio iceio.IO) iter.Seq2[iceberg.DataFile, error] {
+	return s.addedFiles(fio, iceberg.EntryContentData)
+}
+
+// AddedDeleteFiles returns an iterator over delete files that were added by this snapshot.
+// This includes both position delete and equality delete files.
+func (s Snapshot) AddedDeleteFiles(fio iceio.IO) iter.Seq2[iceberg.DataFile, error] {
+	return func(yield func(iceberg.DataFile, error) bool) {
+		for df, err := range s.addedFiles(fio, iceberg.EntryContentPosDeletes) {
+			if !yield(df, err) || err != nil {
+				return
+			}
+		}
+		for df, err := range s.addedFiles(fio, iceberg.EntryContentEqDeletes) {
+			if !yield(df, err) || err != nil {
+				return
+			}
+		}
+	}
+}
+
+// addedFiles returns an iterator over files of the specified content type
+// that were added by this snapshot.
+func (s Snapshot) addedFiles(fio iceio.IO, contentType iceberg.ManifestEntryContent) iter.Seq2[iceberg.DataFile, error] {
+	return func(yield func(iceberg.DataFile, error) bool) {
+		manifests, err := s.Manifests(fio)
+		if err != nil {
+			yield(nil, err)
+			return
+		}
+
+		for _, m := range manifests {
+			// Skip manifests that don't match the content type
+			if contentType == iceberg.EntryContentData && m.ManifestContent() != iceberg.ManifestContentData {
+				continue
+			}
+			if (contentType == iceberg.EntryContentPosDeletes || contentType == iceberg.EntryContentEqDeletes) &&
+				m.ManifestContent() != iceberg.ManifestContentDeletes {
+				continue
+			}
+
+			entries, err := m.FetchEntries(fio, false)
+			if err != nil {
+				yield(nil, err)
+				return
+			}
+
+			for _, entry := range entries {
+				// Only include files that were added by this snapshot
+				if entry.Status() != iceberg.EntryStatusADDED {
+					continue
+				}
+				if entry.SnapshotID() != s.SnapshotID {
+					continue
+				}
+				if entry.DataFile().ContentType() != contentType {
+					continue
+				}
+
+				if !yield(entry.DataFile(), nil) {
+					return
+				}
+			}
+		}
+	}
+}
+
+// Operation returns the operation type for this snapshot (append, overwrite, delete, replace).
+func (s Snapshot) Operation() Operation {
+	if s.Summary == nil {
+		return ""
+	}
+	return s.Summary.Operation
+}
+
 type MetadataLogEntry struct {
 	MetadataFile string `json:"metadata-file"`
 	TimestampMs  int64  `json:"timestamp-ms"`

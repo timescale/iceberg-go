@@ -438,6 +438,19 @@ type snapshotProducer struct {
 	manifestCount       atomic.Int32
 	deletedFiles        map[string]iceberg.DataFile
 	snapshotProps       iceberg.Properties
+	targetBranch        string
+}
+
+// ToBranch sets the target branch for this snapshot operation.
+// If not called, the snapshot will be committed to the main branch.
+func (sp *snapshotProducer) ToBranch(branch string) *snapshotProducer {
+	sp.targetBranch = branch
+	if ref, ok := sp.txn.meta.refs[branch]; ok {
+		sp.parentSnapshotID = ref.SnapshotID
+	} else {
+		sp.parentSnapshotID = -1
+	}
+	return sp
 }
 
 func createSnapshotProducer(op Operation, txn *Transaction, fs iceio.WriteFileIO, commitUUID *uuid.UUID, snapshotProps iceberg.Properties) *snapshotProducer {
@@ -466,6 +479,7 @@ func createSnapshotProducer(op Operation, txn *Transaction, fs iceio.WriteFileIO
 		addedFiles:       []iceberg.DataFile{},
 		deletedFiles:     make(map[string]iceberg.DataFile),
 		snapshotProps:    snapshotProps,
+		targetBranch:     MainBranch,
 	}
 }
 
@@ -771,10 +785,16 @@ func (sp *snapshotProducer) commit() (_ []Update, _ []Requirement, err error) {
 		snapshot.AddedRows = &addedRows
 	}
 
+	// Get the current snapshot ID for the target branch for the requirement
+	var branchSnapshotID *int64
+	if ref, ok := sp.txn.meta.refs[sp.targetBranch]; ok {
+		branchSnapshotID = &ref.SnapshotID
+	}
+
 	return []Update{
 			NewAddSnapshotUpdate(&snapshot),
-			NewSetSnapshotRefUpdate("main", sp.snapshotID, BranchRef, -1, -1, -1),
+			NewSetSnapshotRefUpdate(sp.targetBranch, sp.snapshotID, BranchRef, -1, -1, -1),
 		}, []Requirement{
-			AssertRefSnapshotID("main", sp.txn.meta.currentSnapshotID),
+			AssertRefSnapshotID(sp.targetBranch, branchSnapshotID),
 		}, nil
 }
