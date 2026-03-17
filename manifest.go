@@ -1188,7 +1188,7 @@ func (w *ManifestWriter) ToManifestFile(location string, length int64, opts ...M
 		Path:               location,
 		Len:                length,
 		SpecID:             int32(w.spec.id),
-		Content:            ManifestContentData,
+		Content:            w.content,
 		SeqNumber:          -1,
 		MinSeqNumber:       w.minSeqNum,
 		AddedSnapshotID:    w.snapshotID,
