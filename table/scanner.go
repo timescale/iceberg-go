@@ -20,7 +20,6 @@ package table
 import (
 	"cmp"
 	"context"
-	"errors"
 	"fmt"
 	"iter"
 	"math"
@@ -93,10 +92,11 @@ func (p partitionRecord) Size() int            { return len(p) }
 func (p partitionRecord) Get(pos int) any      { return p[pos] }
 func (p partitionRecord) Set(pos int, val any) { p[pos] = val }
 
-// manifestEntries holds the data and positional delete entries read from manifests.
+// manifestEntries holds the data and delete entries read from manifests.
 type manifestEntries struct {
 	dataEntries             []iceberg.ManifestEntry
 	positionalDeleteEntries []iceberg.ManifestEntry
+	equalityDeleteEntries   []iceberg.ManifestEntry
 	mu                      sync.Mutex
 }
 
@@ -104,6 +104,7 @@ func newManifestEntries() *manifestEntries {
 	return &manifestEntries{
 		dataEntries:             make([]iceberg.ManifestEntry, 0),
 		positionalDeleteEntries: make([]iceberg.ManifestEntry, 0),
+		equalityDeleteEntries:   make([]iceberg.ManifestEntry, 0),
 	}
 }
 
@@ -117,6 +118,12 @@ func (m *manifestEntries) addPositionalDeleteEntry(e iceberg.ManifestEntry) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.positionalDeleteEntries = append(m.positionalDeleteEntries, e)
+}
+
+func (m *manifestEntries) addEqualityDeleteEntry(e iceberg.ManifestEntry) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.equalityDeleteEntries = append(m.equalityDeleteEntries, e)
 }
 
 func newPartitionRecord(partitionData map[int]any, partitionType *iceberg.StructType) partitionRecord {
@@ -338,6 +345,20 @@ func matchDeletesToData(entry iceberg.ManifestEntry, positionalDeletes []iceberg
 	return out, nil
 }
 
+// matchEqualityDeletesToData returns equality delete files that apply to the
+// given data entry. An equality delete applies when its sequence number is
+// strictly greater than the data file's sequence number.
+func matchEqualityDeletesToData(entry iceberg.ManifestEntry, equalityDeletes []iceberg.ManifestEntry) []iceberg.DataFile {
+	dataSeqNum := entry.SequenceNum()
+	out := make([]iceberg.DataFile, 0)
+	for _, del := range equalityDeletes {
+		if del.SequenceNum() > dataSeqNum {
+			out = append(out, del.DataFile())
+		}
+	}
+	return out
+}
+
 // fetchPartitionSpecFilteredManifests retrieves the table's current snapshot,
 // fetches its manifest files, and applies partition-spec filters to remove irrelevant manifests.
 func (scan *Scan) fetchPartitionSpecFilteredManifests(ctx context.Context) ([]iceberg.ManifestFile, error) {
@@ -417,7 +438,7 @@ func (scan *Scan) collectManifestEntries(
 				case iceberg.EntryContentPosDeletes:
 					entries.addPositionalDeleteEntry(e)
 				case iceberg.EntryContentEqDeletes:
-					return errors.New("iceberg-go does not yet support equality deletes")
+					entries.addEqualityDeleteEntry(e)
 				default:
 					return fmt.Errorf("%w: unknown DataFileContent type (%s): %s",
 						ErrInvalidMetadata, df.ContentType(), e)
@@ -472,12 +493,23 @@ func (scan *Scan) PlanFiles(ctx context.Context) ([]FileScanTask, error) {
 		return cmp.Compare(a.SequenceNum(), b.SequenceNum())
 	})
 
+	// Sort equality deletes by sequence number for matching.
+	slices.SortFunc(entries.equalityDeleteEntries, func(a, b iceberg.ManifestEntry) int {
+		return cmp.Compare(a.SequenceNum(), b.SequenceNum())
+	})
+
 	results := make([]FileScanTask, 0, len(entries.dataEntries))
 	for _, e := range entries.dataEntries {
 		deleteFiles, err := matchDeletesToData(e, entries.positionalDeleteEntries)
 		if err != nil {
 			return nil, err
 		}
+
+		// Match equality deletes: an eq delete applies to a data file if the
+		// delete's sequence number is strictly greater than the data file's.
+		eqDeleteFiles := matchEqualityDeletesToData(e, entries.equalityDeleteEntries)
+		deleteFiles = append(deleteFiles, eqDeleteFiles...)
+
 		results = append(results, FileScanTask{
 			File:        e.DataFile(),
 			DeleteFiles: deleteFiles,

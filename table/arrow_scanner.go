@@ -32,6 +32,7 @@ import (
 	"github.com/apache/iceberg-go"
 	iceinternal "github.com/apache/iceberg-go/internal"
 	iceio "github.com/apache/iceberg-go/io"
+	"github.com/apache/iceberg-go/table/deletes"
 	"github.com/apache/iceberg-go/table/internal"
 	"github.com/apache/iceberg-go/table/substrait"
 	"github.com/substrait-io/substrait-go/v7/expr"
@@ -471,7 +472,7 @@ func (as *arrowScan) recordsFromTask(ctx context.Context, task internal.Enumerat
 	}
 	defer iceinternal.CheckedClose(rdr, &err)
 
-	pipeline := make([]recProcessFn, 0, 2)
+	pipeline := make([]recProcessFn, 0, 4)
 	if len(positionalDeletes) > 0 {
 		deletes := set[int64]{}
 		for _, chunk := range positionalDeletes {
@@ -483,6 +484,28 @@ func (as *arrowScan) recordsFromTask(ctx context.Context, task internal.Enumerat
 		}
 
 		pipeline = append(pipeline, processPositionalDeletes(ctx, deletes))
+	}
+
+	// Collect equality delete files from the task's delete files.
+	var eqDeleteFiles []iceberg.DataFile
+	for _, df := range task.Value.DeleteFiles {
+		if df.ContentType() == iceberg.EntryContentEqDeletes {
+			eqDeleteFiles = append(eqDeleteFiles, df)
+		}
+	}
+
+	if len(eqDeleteFiles) > 0 {
+		eqFilter, filterErr := deletes.NewEqualityDeleteFilter(ctx, as.fs, eqDeleteFiles, iceSchema, as.concurrency)
+		if filterErr != nil {
+			return filterErr
+		}
+		if eqFilter != nil {
+			defer eqFilter.Release()
+			pipeline = append(pipeline, func(r arrow.RecordBatch) (arrow.RecordBatch, error) {
+				defer r.Release()
+				return eqFilter.Filter(ctx, r, iceSchema)
+			})
+		}
 	}
 
 	filterFunc, dropFile, err = as.getRecordFilter(ctx, iceSchema)
