@@ -48,6 +48,7 @@ import (
 	"github.com/apache/iceberg-go/internal"
 	iceio "github.com/apache/iceberg-go/io"
 	"github.com/apache/iceberg-go/table"
+	"github.com/apache/iceberg-go/table/deletes"
 	"github.com/google/uuid"
 	"github.com/pterm/pterm"
 	"github.com/stretchr/testify/require"
@@ -2674,6 +2675,69 @@ func (t *TableWritingTestSuite) TestDelete() {
 			t.Equal(int64(1), arrowTable.NumRows())
 		})
 	}
+}
+
+func (t *TableWritingTestSuite) TestEqualityDeleteScan() {
+	if t.formatVersion < 2 {
+		return
+	}
+
+	ident := table.Identifier{"default", "eq_delete_scan_v" + strconv.Itoa(t.formatVersion)}
+	tbl := t.createTable(ident, t.formatVersion, *iceberg.UnpartitionedSpec, t.tableSchema)
+
+	// Write 2 rows
+	newTable, err := array.TableFromJSON(memory.DefaultAllocator, t.arrSchema, []string{
+		`[{"foo": false, "bar": "wrapper_test", "baz": 123, "qux": "2024-01-01"},
+		  {"foo": true, "bar": "keep_this", "baz": 456, "qux": "2024-01-02"}]`,
+	})
+	t.Require().NoError(err)
+	defer newTable.Release()
+
+	tbl, err = tbl.OverwriteTable(t.ctx, newTable, 1, nil)
+	t.Require().NoError(err)
+
+	// Verify 2 rows exist
+	arrowTable, err := tbl.Scan().ToArrowTable(t.ctx)
+	t.Require().NoError(err)
+	t.Equal(int64(2), arrowTable.NumRows())
+
+	// Write equality delete file targeting bar="wrapper_test" (field ID 2)
+	fs := mustFS(t.T(), tbl).(iceio.WriteFileIO)
+	deleteWriter, err := deletes.NewEqualityDeleteWriter(
+		t.ctx, fs, t.tableSchema, *iceberg.UnpartitionedSpec, []int{2}, nil,
+	)
+	t.Require().NoError(err)
+
+	deleteSchema := arrow.NewSchema([]arrow.Field{
+		{Name: "bar", Type: arrow.BinaryTypes.String, Nullable: true},
+	}, nil)
+	deleteTable, err := array.TableFromJSON(memory.DefaultAllocator, deleteSchema, []string{
+		`[{"bar": "wrapper_test"}]`,
+	})
+	t.Require().NoError(err)
+	defer deleteTable.Release()
+
+	rdr := array.NewTableReader(deleteTable, 1)
+	defer rdr.Release()
+	t.Require().True(rdr.Next())
+	deleteRec := rdr.Record()
+
+	deletePath := fmt.Sprintf("%s/eq_delete_scan_v%d/eq-delete-0.parquet", t.location, t.formatVersion)
+	deleteFile, err := deleteWriter.WriteDeleteFile(t.ctx, deletePath, []arrow.Record{deleteRec}, nil)
+	t.Require().NoError(err)
+
+	// Commit the equality delete via RowDelta
+	tx := tbl.NewTransaction()
+	rd := tx.RowDelta(nil)
+	rd.AddDeletes(deleteFile)
+	t.Require().NoError(rd.Commit(t.ctx))
+	tbl, err = tx.Commit(t.ctx)
+	t.Require().NoError(err)
+
+	// Scan and verify only 1 row remains
+	arrowTable, err = tbl.Scan().ToArrowTable(t.ctx)
+	t.Require().NoError(err)
+	t.Equal(int64(1), arrowTable.NumRows())
 }
 
 func (t *TableWritingTestSuite) TestScanPanicOnMapStringKeyStringListValue() {
