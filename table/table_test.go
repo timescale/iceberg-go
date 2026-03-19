@@ -1653,6 +1653,153 @@ func (t *TableWritingTestSuite) TestRewriteFilesNoDeletes() {
 	t.ErrorContains(err, "cannot add files without deleting in a rewrite")
 }
 
+func mustDeleteFile(t *testing.T, spec iceberg.PartitionSpec, content iceberg.ManifestEntryContent, path string, partition map[int]any, count, size int64) iceberg.DataFile {
+	builder, err := iceberg.NewDataFileBuilder(spec, content, path, iceberg.ParquetFile, partition, nil, nil, count, size)
+	require.NoError(t, err)
+	return builder.Build()
+}
+
+func (t *TableWritingTestSuite) TestRowDelta() {
+	if t.formatVersion < 2 {
+		return
+	}
+
+	ident := table.Identifier{"default", "row_delta_v" + strconv.Itoa(t.formatVersion)}
+	tbl := t.createTable(ident, t.formatVersion, *iceberg.UnpartitionedSpec, t.tableSchema)
+
+	dataPath := fmt.Sprintf("%s/row_delta_v%d/data-0.parquet", t.location, t.formatVersion)
+	t.writeParquet(mustFS(t.T(), tbl).(iceio.WriteFileIO), dataPath, t.arrTbl)
+
+	tx := tbl.NewTransaction()
+	t.Require().NoError(tx.AddFiles(t.ctx, []string{dataPath}, nil, false))
+	tbl, err := tx.Commit(t.ctx)
+	t.Require().NoError(err)
+
+	dataFile := mustDataFile(t.T(), *iceberg.UnpartitionedSpec, dataPath, nil, 1, mustFileSize(t.T(), dataPath))
+	posDeleteFile := mustDeleteFile(t.T(), *iceberg.UnpartitionedSpec, iceberg.EntryContentPosDeletes,
+		fmt.Sprintf("%s/row_delta_v%d/pos-delete-0.parquet", t.location, t.formatVersion), nil, 1, 100)
+
+	tx = tbl.NewTransaction()
+	rd := tx.RowDelta(nil)
+	rd.AddRows(dataFile)
+	rd.AddDeletes(posDeleteFile)
+	t.Require().NoError(rd.Commit(t.ctx))
+
+	staged, err := tx.StagedTable()
+	t.Require().NoError(err)
+	t.Equal(table.OpOverwrite, staged.CurrentSnapshot().Summary.Operation)
+	t.Equal("1", staged.CurrentSnapshot().Summary.Properties["added-data-files"])
+	t.Equal("1", staged.CurrentSnapshot().Summary.Properties["added-delete-files"])
+	t.Equal("1", staged.CurrentSnapshot().Summary.Properties["added-position-delete-files"])
+}
+
+func (t *TableWritingTestSuite) TestRowDeltaEqualityDeletes() {
+	if t.formatVersion < 2 {
+		return
+	}
+
+	ident := table.Identifier{"default", "row_delta_eq_deletes_v" + strconv.Itoa(t.formatVersion)}
+	tbl := t.createTable(ident, t.formatVersion, *iceberg.UnpartitionedSpec, t.tableSchema)
+
+	dataPath := fmt.Sprintf("%s/row_delta_eq_deletes_v%d/data-0.parquet", t.location, t.formatVersion)
+	t.writeParquet(mustFS(t.T(), tbl).(iceio.WriteFileIO), dataPath, t.arrTbl)
+
+	tx := tbl.NewTransaction()
+	t.Require().NoError(tx.AddFiles(t.ctx, []string{dataPath}, nil, false))
+	tbl, err := tx.Commit(t.ctx)
+	t.Require().NoError(err)
+
+	eqDeleteFile := mustDeleteFile(t.T(), *iceberg.UnpartitionedSpec, iceberg.EntryContentEqDeletes,
+		fmt.Sprintf("%s/row_delta_eq_deletes_v%d/eq-delete-0.parquet", t.location, t.formatVersion), nil, 1, 100)
+
+	tx = tbl.NewTransaction()
+	rd := tx.RowDelta(nil)
+	rd.AddDeletes(eqDeleteFile)
+	t.Require().NoError(rd.Commit(t.ctx))
+
+	staged, err := tx.StagedTable()
+	t.Require().NoError(err)
+	t.Equal("1", staged.CurrentSnapshot().Summary.Properties["added-delete-files"])
+	t.Equal("1", staged.CurrentSnapshot().Summary.Properties["added-equality-delete-files"])
+}
+
+func (t *TableWritingTestSuite) TestRowDeltaDeletesOnly() {
+	if t.formatVersion < 2 {
+		return
+	}
+
+	ident := table.Identifier{"default", "row_delta_deletes_only_v" + strconv.Itoa(t.formatVersion)}
+	tbl := t.createTable(ident, t.formatVersion, *iceberg.UnpartitionedSpec, t.tableSchema)
+
+	dataPath := fmt.Sprintf("%s/row_delta_deletes_only_v%d/data-0.parquet", t.location, t.formatVersion)
+	t.writeParquet(mustFS(t.T(), tbl).(iceio.WriteFileIO), dataPath, t.arrTbl)
+
+	tx := tbl.NewTransaction()
+	t.Require().NoError(tx.AddFiles(t.ctx, []string{dataPath}, nil, false))
+	tbl, err := tx.Commit(t.ctx)
+	t.Require().NoError(err)
+
+	posDeleteFile := mustDeleteFile(t.T(), *iceberg.UnpartitionedSpec, iceberg.EntryContentPosDeletes,
+		fmt.Sprintf("%s/row_delta_deletes_only_v%d/pos-delete-0.parquet", t.location, t.formatVersion), nil, 1, 100)
+
+	tx = tbl.NewTransaction()
+	rd := tx.RowDelta(nil)
+	rd.AddDeletes(posDeleteFile)
+	t.Require().NoError(rd.Commit(t.ctx))
+
+	staged, err := tx.StagedTable()
+	t.Require().NoError(err)
+	t.Equal("1", staged.CurrentSnapshot().Summary.Properties["added-delete-files"])
+}
+
+func (t *TableWritingTestSuite) TestRowDeltaEmptyNoop() {
+	if t.formatVersion < 2 {
+		return
+	}
+
+	ident := table.Identifier{"default", "row_delta_empty_v" + strconv.Itoa(t.formatVersion)}
+	tbl := t.createTable(ident, t.formatVersion, *iceberg.UnpartitionedSpec, t.tableSchema)
+
+	tx := tbl.NewTransaction()
+	rd := tx.RowDelta(nil)
+	t.Require().NoError(rd.Commit(t.ctx))
+
+	staged, err := tx.StagedTable()
+	t.Require().NoError(err)
+	t.Nil(staged.CurrentSnapshot())
+}
+
+func (t *TableWritingTestSuite) TestRowDeltaAddRowsPanicsOnDeleteFile() {
+	if t.formatVersion < 2 {
+		return
+	}
+
+	deleteFile := mustDeleteFile(t.T(), *iceberg.UnpartitionedSpec, iceberg.EntryContentPosDeletes,
+		"delete.parquet", nil, 1, 100)
+
+	ident := table.Identifier{"default", "row_delta_panic_rows_v" + strconv.Itoa(t.formatVersion)}
+	tbl := t.createTable(ident, t.formatVersion, *iceberg.UnpartitionedSpec, t.tableSchema)
+
+	tx := tbl.NewTransaction()
+	rd := tx.RowDelta(nil)
+	t.Panics(func() { rd.AddRows(deleteFile) })
+}
+
+func (t *TableWritingTestSuite) TestRowDeltaAddDeletesPanicsOnDataFile() {
+	if t.formatVersion < 2 {
+		return
+	}
+
+	dataFile := mustDataFile(t.T(), *iceberg.UnpartitionedSpec, "data.parquet", nil, 1, 100)
+
+	ident := table.Identifier{"default", "row_delta_panic_deletes_v" + strconv.Itoa(t.formatVersion)}
+	tbl := t.createTable(ident, t.formatVersion, *iceberg.UnpartitionedSpec, t.tableSchema)
+
+	tx := tbl.NewTransaction()
+	rd := tx.RowDelta(nil)
+	t.Panics(func() { rd.AddDeletes(dataFile) })
+}
+
 func (t *TableWritingTestSuite) TestExpireSnapshots() {
 	fs := iceio.LocalFS{}
 
