@@ -24,6 +24,7 @@ type ManageSnapshots struct {
 	txn     *Transaction
 	updates []Update
 	reqs    []Requirement
+	err     error
 }
 
 // NewManageSnapshots creates a new ManageSnapshots instance for the given transaction.
@@ -43,12 +44,14 @@ func (m *ManageSnapshots) CreateBranch(name string, snapshotID int64) *ManageSna
 }
 
 // CreateBranchFromCurrent creates a new branch pointing to the current snapshot.
-// If there is no current snapshot, this operation will fail during commit.
+// If there is no current snapshot, the error is deferred until Commit.
 func (m *ManageSnapshots) CreateBranchFromCurrent(name string) *ManageSnapshots {
 	snap := m.txn.meta.currentSnapshot()
-	if snap != nil {
-		m.updates = append(m.updates, NewSetSnapshotRefUpdate(name, snap.SnapshotID, BranchRef, -1, -1, -1))
+	if snap == nil {
+		m.err = fmt.Errorf("%w: cannot create branch from current snapshot: no current snapshot", ErrInvalidOperation)
+		return m
 	}
+	m.updates = append(m.updates, NewSetSnapshotRefUpdate(name, snap.SnapshotID, BranchRef, -1, -1, -1))
 	return m
 }
 
@@ -94,6 +97,9 @@ func (m *ManageSnapshots) ReplaceBranch(from, to string) *ManageSnapshots {
 
 // Commit applies all pending branch/tag operations to the transaction.
 func (m *ManageSnapshots) Commit() error {
+	if m.err != nil {
+		return m.err
+	}
 	if len(m.updates) == 0 {
 		return nil
 	}

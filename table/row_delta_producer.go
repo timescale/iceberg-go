@@ -152,8 +152,11 @@ func (rd *rowDeltaProducer) writeDataManifest() (_ iceberg.ManifestFile, err err
 
 	counter := &internal.CountingWriter{W: out}
 	currentSpec, err := rd.txn.meta.CurrentSpec()
-	if err != nil || currentSpec == nil {
+	if err != nil {
 		return nil, fmt.Errorf("could not get current partition spec: %w", err)
+	}
+	if currentSpec == nil {
+		return nil, fmt.Errorf("current partition spec is nil")
 	}
 
 	wr, err := iceberg.NewManifestWriter(rd.txn.meta.formatVersion, counter,
@@ -185,8 +188,11 @@ func (rd *rowDeltaProducer) writeDeleteManifest() (_ iceberg.ManifestFile, err e
 
 	counter := &internal.CountingWriter{W: out}
 	currentSpec, err := rd.txn.meta.CurrentSpec()
-	if err != nil || currentSpec == nil {
+	if err != nil {
 		return nil, fmt.Errorf("could not get current partition spec: %w", err)
+	}
+	if currentSpec == nil {
+		return nil, fmt.Errorf("current partition spec is nil")
 	}
 
 	// For delete files, use ManifestContentDeletes
@@ -282,16 +288,34 @@ func (rd *rowDeltaProducer) commit() (_ []Update, _ []Requirement, err error) {
 		parentSnapshot = &rd.parentSnapshotID
 	}
 
+	firstRowID := int64(0)
+	var addedRows int64
+
 	out, err := rd.io.Create(manifestListFilePath)
 	if err != nil {
 		return nil, nil, err
 	}
 	defer internal.CheckedClose(out, &err)
 
-	err = iceberg.WriteManifestList(rd.txn.meta.formatVersion, out,
-		rd.snapshotID, parentSnapshot, &nextSequence, 0, newManifests)
-	if err != nil {
-		return nil, nil, err
+	if rd.txn.meta.formatVersion == 3 {
+		firstRowID = rd.txn.meta.NextRowID()
+		writer, wrErr := iceberg.NewManifestListWriterV3(out, rd.snapshotID, nextSequence, firstRowID, parentSnapshot)
+		if wrErr != nil {
+			return nil, nil, wrErr
+		}
+		defer internal.CheckedClose(writer, &err)
+		if wrErr = writer.AddManifests(newManifests); wrErr != nil {
+			return nil, nil, wrErr
+		}
+		if writer.NextRowID() != nil {
+			addedRows = *writer.NextRowID() - firstRowID
+		}
+	} else {
+		err = iceberg.WriteManifestList(rd.txn.meta.formatVersion, out,
+			rd.snapshotID, parentSnapshot, &nextSequence, firstRowID, newManifests)
+		if err != nil {
+			return nil, nil, err
+		}
 	}
 
 	snapshot := Snapshot{
@@ -302,6 +326,10 @@ func (rd *rowDeltaProducer) commit() (_ []Update, _ []Requirement, err error) {
 		Summary:          &summary,
 		SchemaID:         &rd.txn.meta.currentSchemaID,
 		TimestampMs:      time.Now().UnixMilli(),
+	}
+	if rd.txn.meta.formatVersion == 3 {
+		snapshot.FirstRowID = &firstRowID
+		snapshot.AddedRows = &addedRows
 	}
 
 	// Get the current snapshot ID for the target branch for the requirement
