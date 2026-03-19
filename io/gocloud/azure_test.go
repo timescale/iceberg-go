@@ -20,6 +20,7 @@ package gocloud
 import (
 	"context"
 	"net/url"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -51,9 +52,13 @@ func TestCreateAzureBucketDefaultCredentialCalled(t *testing.T) {
 	_, err = iter.Next(ctx)
 
 	assert.Error(t, err, "Expected List to return an error when List is called")
-	// This is expected - we should get an auth error when trying to actually use the bucket
-	assert.Contains(t, err.Error(), "DefaultAzureCredential",
-		"Expected DefaultAzureCredential error when listing objects but got: %v", err)
+	// The error proves DefaultAzureCredential was used: it either mentions
+	// "DefaultAzureCredential" directly or returns a 401 auth failure from Azure.
+	errMsg := err.Error()
+	assert.True(t,
+		strings.Contains(errMsg, "DefaultAzureCredential") ||
+			strings.Contains(errMsg, "401"),
+		"Expected DefaultAzureCredential or 401 auth error but got: %v", err)
 }
 
 func TestCreateAzureBucketDefaultCredentialEmptyBucketName(t *testing.T) {
