@@ -15,11 +15,35 @@
  - limitations under the License.
  -->
 
-# Iceberg Golang
+# Iceberg Golang (Timescale Fork)
 
 [![Go Reference](https://pkg.go.dev/badge/github.com/apache/iceberg-go.svg)](https://pkg.go.dev/github.com/apache/iceberg-go)
 
 `iceberg` is a Golang implementation of the [Iceberg table spec](https://iceberg.apache.org/spec/).
+
+## Timescale Fork
+
+This is a [Timescale fork](https://github.com/timescale/iceberg-go) of [apache/iceberg-go](https://github.com/apache/iceberg-go), used by [tigerlake-go](https://github.com/timescale/tigerlake-go). The `feat/equality-deletes` branch tracks upstream `main` and adds write-path features not yet available upstream.
+
+### What we added
+
+- **Equality delete writer** -- write equality delete files for UPDATE/DELETE operations
+- **Position delete writer** -- write position delete files
+- **RowDelta commit** -- atomic commit of data files + delete files in a single table operation
+- **Equality delete scanner** -- filter equality deletes during scan (read path integration)
+- **RewriteFiles** -- replace data files atomically for compaction operations
+- **Snapshot management** -- `CreateBranch`, `ReplaceBranch`, `ExpireSnapshots`, snapshot tagging
+
+### What we get from upstream (included via rebase)
+
+- **OAuth token refresh** ([#793](https://github.com/apache/iceberg-go/pull/793)) -- REST catalog now refreshes OAuth tokens automatically in the HTTP roundtripper
+- **`schema.name-mapping.default` fix** ([#803](https://github.com/apache/iceberg-go/pull/803)) -- no longer sets this property by default, fixing Databricks Unity Catalog compatibility
+
+### What we decided not to implement
+
+- **Application-level auth retry / catalog recreation** -- Redpanda Connect [added this](https://github.com/redpanda-data/connect/pull/4117) as a workaround before upstream #793 was merged. With #793 now in our fork, token refresh is handled inside the library and this workaround is unnecessary.
+- **Vended credential refresh** ([#795](https://github.com/apache/iceberg-go/pull/795)) -- still open upstream. tigerlake-go doesn't use vended credentials (credentials returned inline in LoadTable responses). We'll pick this up when it merges upstream.
+- **Explicit SigV4 AWS config for Glue** -- Redpanda Connect [added config wiring](https://github.com/redpanda-data/connect/pull/4123) for explicit AWS credentials in SigV4 catalog auth. tigerlake-go uses `catalog.Load` with flat properties and has its own `pkg/awsauth` for STS credential management. No change needed.
 
 ## Build From Source
 
